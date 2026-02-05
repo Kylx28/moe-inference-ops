@@ -34,4 +34,5 @@ __device__ DataType softmax(
     return score;
 }
 
-template __device__ float softmax<float>(cg::thread_block_tile<32> const&, float, int32_t, int32_t);
+template __device__ float softmax<float>(cg::thread_block_tile<32> const&,
+                                         float, int32_t, int32_t);
