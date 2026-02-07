@@ -1,13 +1,8 @@
 #pragma once
 
+#include <torch/extension.h>
 #include <cuda_runtime.h>
 #include <cub/cub.cuh>
-
-// Constants for all kernels
-static constexpr int num_threads_per_block = 512;
-static constexpr int num_bins = 512;
-static constexpr int top_k = 2048;
-static constexpr int num_top_k_items_per_thread = top_k / num_threads_per_block;
 
 /**
  * @brief Performs a high-performance histogram-based Top-K selection.
@@ -35,13 +30,4 @@ __global__ void topk_histogram_kernel(
  */
 static inline __device__ uint16_t extractBinIdx(float x);
 
-/**
- * @brief Host-side launcher for the Top-K histogram kernel.
- */
-void launch_topk_histogram(
-    const float* d_logits,
-    int* d_out_indices,
-    int n_elements,
-    int batch_size,
-    cudaStream_t stream
-);
+torch::Tensor topk_histogram_forward(torch::Tensor logits, int k);

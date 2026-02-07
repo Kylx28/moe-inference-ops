@@ -1,3 +1,5 @@
+// RadixSort Based Top-K
+
 #include "topk.cuh"
 
 // Taken from: https://github.com/AlpinDale/topk_tests/blob/88903e51516ac5a502501dc79b49bef73cf2542f/topk.cu#L17
@@ -20,28 +22,33 @@ __global__ void topk_histogram_kernel(
 {
     static constexpr int num_final_items = 2048;
 
-    // Shared memory config using union
-
+    // Initialize shared memory buffers
     __shared__ int shared_mem_histogram[kNumBins];
     __shared__ int shared_mem_threshold_bin[1];
+    __shared__ int shared_mem_indices[kTopK];
+    __shared__ int shared_mem_final_idx[1];
 
     using BlockScan = cub::BlockScan<int, kNumThreads>;
-    using BlockSort = cub::BlockRadixSort<float, kNumThreads, 
-                                          num_final_items/kNumThreads, int>;
+    using BlockSort = cub::BlockRadixSort<float, kNumThreads, num_final_items/kNumThreads, int>;
+    
+    // Initialize arrays for prefix sum offset
+    int prefix_sum{0};
+    int final_sum{0};
 
+    // Shared memory config using union
     __shared__ union {
         typename BlockScan::TempStorage scan_storage;
         typename BlockSort::TempStorage sort_storage;
         struct {
-            float values[num_final_items];
+            float logits[num_final_items];
             int indices[num_final_items];
-        } finalists;
-    } temp_storage;
+        } final_items;
+    } shared_mem_data;
 
     // Histogram Pass
     // Each thread handles one bin (same number of threads and bins)
     if(threadIdx.x < kNumBins){
-        shared_mem_histogram[threadIdx.x] = 0
+        shared_mem_histogram[threadIdx.x] = 0;
     }
 
     __syncthreads();
@@ -55,4 +62,134 @@ __global__ void topk_histogram_kernel(
 
     __syncthreads();
 
+    // Prefix Sum
+    int bin{0};
+    if(threadIdx.x < kNumBins){
+        bin = shared_mem_histogram[threadIdx.x];
+    }
+
+    __syncthreads();
+
+    BlockScan(shared_mem_data.scan_storage).ExclusiveSum(bin, prefix_sum, final_sum);
+
+    if(threadIdx.x < kNumBins){
+        shared_mem_histogram[threadIdx.x] = prefix_sum;
+    }
+
+    __syncthreads();
+
+    // Threshold Bin
+    if(threadIdx.x < kNumBins){
+        int next_prefix;
+        if(threadIdx.x == kNumBins - 1){
+            next_prefix = final_sum;
+        }
+        else{
+            next_prefix = shared_mem_histogram[threadIdx.x + 1];
+        }
+
+        if(prefix_sum < kTopK && next_prefix >= kTopK){
+            shared_mem_threshold_bin[0] = threadIdx.x;
+        }
+    }
+
+    __syncthreads();
+
+    int threshold_bin_idx = shared_mem_threshold_bin[0];
+
+    // Collection
+    if(threadIdx.x == 0){
+        shared_mem_final_idx[0] = 0;
+    }
+
+    __syncthreads();
+
+    for(int i = threadIdx.x; i < n_elements; i += kNumThreads){
+        float logit = logits[i];
+        uint16_t idx = extractBinIdx(logit);
+
+        if(idx < threshold_bin_idx){
+            int destination_idx = atomicAdd(&shared_mem_histogram[idx], 1);
+            if(destination_idx < kTopK){
+                shared_mem_indices[destination_idx] = i;
+            }
+        }
+        else if(idx == threshold_bin_idx){
+            int destination_idx = atomicAdd(&shared_mem_final_idx[0], 1);
+            if(destination_idx < num_final_items){
+                shared_mem_data.final_items.logits[destination_idx] = logit;
+                shared_mem_data.final_items.indices[destination_idx] = i;
+
+            }
+        }
+    }
+
+    __syncthreads();
+
+    // Sort and Merge
+    static constexpr int num_final_items_per_thread = num_final_items / kNumThreads;
+    int threshold_count = shared_mem_final_idx[0];
+    int needed = kTopK - shared_mem_histogram[kNumBins - 1];
+
+    if(needed > 0){
+        float final_logits[num_final_items_per_thread];
+        int final_indices[num_final_items_per_thread];
+
+    #pragma unroll
+        for(int i = 0; i < num_final_items_per_thread; ++i){
+            final_logits[i] = -FLT_MAX;
+        }
+    
+    #pragma unroll
+        for(int i = 0; i < num_final_items_per_thread; ++i){
+            int source_idx = threadIdx.x * num_final_items_per_thread + i;
+            if(source_idx < threshold_count){
+                final_logits[i] = shared_mem_data.final_items.logits[source_idx];
+                final_indices[i] = shared_mem_data.final_items.indices[source_idx];
+
+            }
+        }
+
+        BlockSort(shared_mem_data.sort_storage).SortDescendingBlockedToStriped(final_logits, final_indices);
+
+    #pragma unroll
+        for(int i = 0; i < num_final_items_per_thread; ++i){
+            int source_idx = threadIdx.x * num_final_items_per_thread + i;
+            if(source_idx < threshold_count){
+                shared_mem_data.final_items.logits[source_idx] = final_logits[i];
+                shared_mem_data.final_items.indices[source_idx] = final_indices[i];
+            }
+        }
+
+        __syncthreads();
+
+        for(int i = threadIdx.x; i < needed; i += kNumThreads){
+            shared_mem_indices[shared_mem_histogram[kNumBins - 1] + i] = shared_mem_data.final_items.indices[i];
+        }
+
+    }
+
+    __syncthreads();
+
+    // Copy back to shared memory
+    #pragma unroll
+    for(int i = 0; i < num_final_items_per_thread; i++){
+        int local_idx = i * kNumThreads + threadIdx.x;
+
+        if(local_idx < kTopK){
+            out_indices[local_idx] = shared_mem_indices[local_idx];
+        }
+    }
+}
+
+torch::Tensor topk_histogram_forward(torch::Tensor logits, int k) {
+    auto out_indices = torch::empty({k}, logits.options().dtype(torch::kInt32));
+    // Hardcoded templates to match your script's K_VALUE
+    topk_histogram_kernel<512, 512, 2048><<<1, 512>>>(
+        logits.data_ptr<float>(), out_indices.data_ptr<int>(), logits.size(0));
+    return out_indices;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("forward", &topk_histogram_forward, "TopK Histogram Forward");
 }
