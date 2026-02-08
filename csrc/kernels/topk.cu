@@ -3,6 +3,11 @@
 #include "topk.cuh"
 
 // Taken from: https://github.com/AlpinDale/topk_tests/blob/88903e51516ac5a502501dc79b49bef73cf2542f/topk.cu#L17
+/**
+ * @brief Helper to calculate the order-preserving bin index for a float.
+ * * Maps a float to a 16-bit unsigned integer such that the relative 
+ * order is preserved, then buckets it into the histogram range.
+ **/
 static inline __device__ uint16_t extractBinIdx(float x)
 {
   union {
@@ -14,13 +19,26 @@ static inline __device__ uint16_t extractBinIdx(float x)
   return 511 - (tmp.u16 >> 7);
 }
 
+/**
+ * Performs a high-performance histogram-based Top-K selection.
+ * 1. Build a coarse-grained histogram to find a threshold bin.
+ * 2. Prune elements and perform a localized Radix Sort on the threshold bin.
+ * 
+ * @tparam kNumThreads Number of threads per block (must be a power of 2).
+ * @tparam kNumBins    Number of histogram buckets (default 512).
+ * @tparam kTopK       The 'K' in Top-K.
+ * @param logits      Pointer to the input data (usually log-probabilities).
+ * @param out_indices Pointer to the output buffer for Top-K indices.
+ * @param n_elements  Total number of elements in the input array.
+ * 
+ **/
 template <int kNumThreads, int kNumBins, int kTopK>
 __global__ void topk_histogram_kernel(
     const float* __restrict__ logits, 
     int* __restrict__ out_indices,
     int n_elements)
 {
-    static constexpr int num_final_items = 2048;
+    static constexpr int num_final_items = 4096;
 
     // Initialize shared memory buffers
     __shared__ int shared_mem_histogram[kNumBins];
@@ -142,7 +160,7 @@ __global__ void topk_histogram_kernel(
     
     #pragma unroll
         for(int i = 0; i < num_final_items_per_thread; ++i){
-            int source_idx = threadIdx.x * num_final_items_per_thread + i;
+            int source_idx = i * kNumThreads + threadIdx.x;
             if(source_idx < threshold_count){
                 final_logits[i] = shared_mem_data.final_items.logits[source_idx];
                 final_indices[i] = shared_mem_data.final_items.indices[source_idx];
@@ -154,7 +172,7 @@ __global__ void topk_histogram_kernel(
 
     #pragma unroll
         for(int i = 0; i < num_final_items_per_thread; ++i){
-            int source_idx = threadIdx.x * num_final_items_per_thread + i;
+            int source_idx = i * kNumThreads + threadIdx.x;
             if(source_idx < threshold_count){
                 shared_mem_data.final_items.logits[source_idx] = final_logits[i];
                 shared_mem_data.final_items.indices[source_idx] = final_indices[i];
@@ -166,7 +184,6 @@ __global__ void topk_histogram_kernel(
         for(int i = threadIdx.x; i < needed; i += kNumThreads){
             shared_mem_indices[shared_mem_histogram[kNumBins - 1] + i] = shared_mem_data.final_items.indices[i];
         }
-
     }
 
     __syncthreads();
@@ -175,7 +192,6 @@ __global__ void topk_histogram_kernel(
     #pragma unroll
     for(int i = 0; i < num_final_items_per_thread; i++){
         int local_idx = i * kNumThreads + threadIdx.x;
-
         if(local_idx < kTopK){
             out_indices[local_idx] = shared_mem_indices[local_idx];
         }
@@ -184,7 +200,6 @@ __global__ void topk_histogram_kernel(
 
 torch::Tensor topk_histogram_forward(torch::Tensor logits, int k) {
     auto out_indices = torch::empty({k}, logits.options().dtype(torch::kInt32));
-    // Hardcoded templates to match your script's K_VALUE
     topk_histogram_kernel<512, 512, 2048><<<1, 512>>>(
         logits.data_ptr<float>(), out_indices.data_ptr<int>(), logits.size(0));
     return out_indices;
