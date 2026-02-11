@@ -1,24 +1,20 @@
 #pragma once
 
-#include <cuda_runtime.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
-#include <cuda/std/limits>
-#include <math.h>
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 namespace cg = cooperative_groups;
 
-static constexpr int WARP_SIZE = 32;
+#ifndef WARP_SIZE
+#define WARP_SIZE 32
+#endif
 
-/**
- * @brief Numerically stable warp-level softmax.
- * * Implementation must be explicitly instantiated in the .cu file 
- * for the desired DataTypes (float, half, nv_bfloat16).
- */
 template <typename DataType>
-__device__ DataType softmax(
-    cg::thread_block_tile<32> const& warp, 
+__device__ DataType softmax_device(
+    cg::thread_block_tile<WARP_SIZE> const& warp,
     DataType score,
-    int32_t lane_idx, 
+    int32_t lane_idx,
     int32_t n_experts
 );
